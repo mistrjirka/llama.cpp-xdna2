@@ -55,6 +55,8 @@ struct AttnJob {
     int64_t       window = 0;            // sliding window in cells (query p sees cells p - window + 1 .. p; a multiple of 16), 0 = causal
     int64_t       rot = 0;               // > 0: the cells are a ring rotated by rot (cell order = (position order + rot) % n_cells, a
     int64_t       n_cells = 0;           //      sliding-window cache that wrapped around); cells, positions and p0 are then in rotated order
+    const int32_t * cells = nullptr;     // != null: gathered rows, row i of the band is cache cell cells[i] (one sequence of a multi-sequence batch);
+    int           shadow_slot = 0;       //      the cells, positions and p0 are then in gathered order and the shadow (slot >= 1) is re-encoded each call
     const void *  k = nullptr;           // cache views: cell c of kv head g at (char *) k + c * kv_row_stride + g * kv_head_stride (D f16/bf16)
     const void *  v = nullptr;
     bool          bf16 = false;

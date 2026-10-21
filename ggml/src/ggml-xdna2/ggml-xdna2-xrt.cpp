@@ -833,15 +833,16 @@ private:
         return c.instr.emplace(key, std::make_pair(std::move(bi), uint32_t(w.size()))).first->second;
     }
 
-    FaShadow & get_fa_shadow(const FaShape & sh, const void * id, int64_t rows) {
-        FaShadow & s = fa_shadows_[id];
+    FaShadow & get_fa_shadow(const FaShape & sh, const void * id, int slot, int64_t rows) {
+        FaShadow & s = fa_shadows_[{id, slot}];
         if (s.variant != sh.variant()) {
             s = FaShadow{};
             s.variant = sh.variant();
         }
         if (s.cap_rows < rows) {
             const double t0 = now_s();
-            const int64_t cap = (rows + 255) / 256 * 256;
+            const int64_t step = slot ? 2048 : 256;      // a gathered sequence grows with its prompt: fewer reallocations
+            const int64_t cap = (rows + step - 1) / step * step;
             const size_t bytes = size_t(sh.nkv) * size_t(cap / FA_BLK) * sh.obj();
             s.k = xrt::ext::bo{dev_, bytes};
             s.v = xrt::ext::bo{dev_, bytes};
@@ -898,7 +899,7 @@ private:
         const int64_t b_align = int64_t(4096 / std::gcd<size_t>(sh.obj(), 4096));
         auto first_block = [&](int64_t d_first) { return wb ? std::max<int64_t>(0, d_first - wb) / b_align * b_align : 0; };
         const int64_t b_min = first_block(d0);
-        FaShadow & s = get_fa_shadow(sh, j.kv_id, std::max(j.kv_cap, nb_total * FA_BLK));
+        FaShadow & s = get_fa_shadow(sh, j.kv_id, j.shadow_slot, std::max(j.kv_cap, nb_total * FA_BLK));
         const int64_t cap_blocks = s.cap_rows / FA_BLK;
 
         // 1. shadow KV: (re)encode the blocks that are new, partial, or whose rows changed
@@ -909,7 +910,7 @@ private:
         #pragma omp parallel for schedule(static) num_threads(pf_threads())
 #endif
         for (int64_t b = b_min; b < nb_total; ++b) {
-            if (j.rot > 0 || !s.full[b] || (b + 1) * FA_BLK > n_valid || b >= j.p0 / FA_BLK) { todo[b] = 1; continue; }   // rotated: re-encode all
+            if (j.rot > 0 || j.cells || !s.full[b] || (b + 1) * FA_BLK > n_valid || b >= j.p0 / FA_BLK) { todo[b] = 1; continue; }   // rotated: re-encode all
             if (fa_block_fingerprint(j.k, j.v, j.kv_row_stride, row_bytes, b) != s.fp[b]) todo[b] = 1;
         }
         int64_t lo = nb_total, hi = -1, n_enc = 0;
@@ -923,12 +924,12 @@ private:
                 for (int g = 0; g < sh.nkv; ++g) {
                     if (!todo[b]) continue;
                     const size_t off = (size_t(g) * cap_blocks + size_t(b)) * OBJ;
-                    fa_encode_kv_block(sh, kb + off, vb + off, j.k, j.v, j.bf16, j.kv_row_stride, j.kv_head_stride, g, b, n_valid, j.rot, j.n_cells);
+                    fa_encode_kv_block(sh, kb + off, vb + off, j.k, j.v, j.bf16, j.kv_row_stride, j.kv_head_stride, g, b, n_valid, j.rot, j.n_cells, j.cells);
                 }
             }
             for (int64_t b = lo; b <= hi; ++b) {
                 if (!todo[b]) continue;
-                s.full[b] = j.rot == 0 && (b + 1) * FA_BLK <= n_valid;       // a rotated encoding is never reused
+                s.full[b] = j.rot == 0 && !j.cells && (b + 1) * FA_BLK <= n_valid;       // a rotated or gathered encoding is never reused
                 if (s.full[b]) s.fp[b] = fa_block_fingerprint(j.k, j.v, j.kv_row_stride, row_bytes, b);
             }
             for (int g = 0; g < sh.nkv; ++g) {
@@ -1041,7 +1042,7 @@ private:
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int>, uint32_t> pf_instr_words_;
     std::map<std::string, std::unique_ptr<FaCtx>> fa_ctxs_;
     std::string last_fa_variant_;
-    std::map<const void *, FaShadow> fa_shadows_;
+    std::map<std::pair<const void *, int>, FaShadow> fa_shadows_;      // (layer cache, slot)
     xrt::bo fa_qbuf_, fa_obuf_;
     size_t fa_qbuf_bytes_ = 0, fa_obuf_bytes_ = 0;
     int last_ctx_ = 0;      // 0 none, 1 decode, 2 prefill, 3 attention

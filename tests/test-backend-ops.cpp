@@ -8558,6 +8558,45 @@ struct test_flash_attn_ext_causal : public test_flash_attn_ext {
     }
 };
 
+// flash attention over a KV cache shared by two sequences whose prompts are processed in one batch (llama-server with parallel slots): the cells
+// are [ctx A][ctx B][new A][new B], the nb = nA + nB queries are A's new tokens then B's, and a query sees the cells of its own sequence up to
+// itself. Each sequence is a causal band over cells that are not adjacent, so the batch is no single band.
+struct test_flash_attn_ext_seqs : public test_flash_attn_ext {
+    const int64_t ctx_a, n_a, ctx_b, n_b;
+
+    test_flash_attn_ext_seqs(int64_t hs, int64_t n_head_kv, int64_t n_group, int64_t ctx_a, int64_t n_a, int64_t ctx_b, int64_t n_b)
+        : test_flash_attn_ext(hs, hs, n_head_kv, {n_group, 1}, ctx_a + n_a + ctx_b + n_b, n_a + n_b, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                              GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}),
+          ctx_a(ctx_a), n_a(n_a), ctx_b(ctx_b), n_b(n_b) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",seqs=[" + std::to_string(ctx_a) + "," + std::to_string(n_a) + "," + std::to_string(ctx_b) + "," +
+               std::to_string(n_b) + "]";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+
+        std::vector<int64_t> cells_a, cells_b;
+        for (int64_t c = 0; c < ctx_a; ++c)               cells_a.push_back(c);
+        for (int64_t c = 0; c < ctx_b; ++c)               cells_b.push_back(ctx_a + c);
+        for (int64_t c = 0; c < n_a; ++c)                 cells_a.push_back(ctx_a + ctx_b + c);
+        for (int64_t c = 0; c < n_b; ++c)                 cells_b.push_back(ctx_a + ctx_b + n_a + c);
+
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        const int64_t n_kv = m->ne[0];
+        std::vector<ggml_fp16_t> data(ggml_nelements(m), ggml_fp32_to_fp16(-INFINITY));
+        for (int64_t t = 0; t < n_a + n_b; ++t) {
+            const std::vector<int64_t> & cells = t < n_a ? cells_a : cells_b;
+            const int64_t n_vis = t < n_a ? ctx_a + t + 1 : ctx_b + (t - n_a) + 1;
+            for (int64_t i = 0; i < n_vis; ++i) {
+                data[t*n_kv + cells[i]] = ggml_fp32_to_fp16(0.0f);
+            }
+        }
+        ggml_backend_tensor_set(m, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11705,6 +11744,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (float q_range : { 4.0f, 20.0f }) {
                 test_cases.emplace_back(new test_flash_attn_ext_causal(hs, n_head_kv, 4, 1030, 75, 0, GGML_TYPE_F16, q_range));
             }
+        }
+    }
+
+    // two sequences in one batch: scattered cells per sequence (the last case has a 8-token piece, which an accelerator may leave to the CPU)
+    for (int hs : { 128, 256 }) {
+        for (int n_head_kv : { 4, 8 }) {
+            for (std::array<int, 4> sq : { std::array<int, 4>{ 512, 128, 256, 64 }, { 0, 300, 0, 200 }, { 1000, 50, 40, 40 }, { 500, 8, 500, 100 } }) {
+                test_cases.emplace_back(new test_flash_attn_ext_seqs(hs, n_head_kv, 4, sq[0], sq[1], sq[2], sq[3]));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_seqs(hs, n_head_kv, 1, 512, 128, 256, 64));
         }
     }
 

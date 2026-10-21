@@ -15,6 +15,7 @@
 #include "ggml-xdna2-attn.h"
 #include "ggml-xdna2-bfp.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <chrono>
@@ -572,7 +573,7 @@ static void ggml_backend_xdna2_free(ggml_backend_t backend) {
 // FLASH_ATTN_EXT (prefill) on the NPU attention kernel
 //
 
-// shapes the attention kernel serves (the runtime conditions -- a causal or sliding-window mask -- are checked in xdna2_fa_band)
+// shapes the attention kernel serves (the runtime conditions -- a causal or sliding-window mask per sequence -- are checked in xdna2_fa_plan)
 static FaShape xdna2_fa_shape(const ggml_tensor * op) {
     FaShape sh;
     sh.d   = int(op->src[0]->ne[0]);
@@ -607,13 +608,7 @@ static bool xdna2_fa_shape_ok(const ggml_tensor * op) {
 // the cell order rotated by rot (cell = (i + rot) % n_kv), rot is returned too (the NPU shadow of the cache is then built in that order).
 // Checked once per mask tensor and graph (all layers of a kind share the mask; two masks are cached: the full and the sliding-window one).
 struct FaBand { int64_t p0 = -1, window = 0, rot = 0; };
-static FaBand xdna2_fa_band(const ggml_tensor * mask, int64_t n_kv, int64_t n_tok, uint64_t graph_id) {
-    struct Entry { const void * data = nullptr; uint64_t graph = UINT64_MAX; int64_t kv = -1, tok = -1; FaBand band; };
-    static Entry cache[2];
-    static int next = 0;
-    for (const Entry & e : cache) {
-        if (e.data == mask->data && e.graph == graph_id && e.kv == n_kv && e.tok == n_tok) return e.band;
-    }
+static FaBand xdna2_fa_single_band(const ggml_tensor * mask, int64_t n_kv, int64_t n_tok) {
     const uint16_t zero = 0x0000, ninf = 0xFC00;
     auto row = [&](int64_t t) { return reinterpret_cast<const uint16_t *>(static_cast<const char *>(mask->data) + t * mask->nb[1]); };
     FaBand b;
@@ -644,9 +639,143 @@ static FaBand xdna2_fa_band(const ggml_tensor * mask, int64_t n_kv, int64_t n_to
         for (int64_t c = 0; c < n_kv && hi < 0; ++c) if (last[c] == zero && last[(c + 1) % n_kv] != zero) hi = c;
         if (hi >= 0 && (hi + 1) % n_kv != 0) check((hi + 1) % n_kv);
     }
-    cache[next] = Entry{ mask->data, graph_id, n_kv, n_tok, b };
-    next ^= 1;
     return b;
+}
+
+
+// A batch of several sequences (llama-server with parallel prompts) gives a mask with one band per sequence, over cells that need not start at 0
+// or touch each other. The rows are cut into segments, one per sequence; a segment's cells (those any of its rows sees, in cell order) are gathered
+// into a private K/V shadow, where its rows form the same causal / sliding-window band as above.
+struct FaSegment {
+    int64_t t0 = 0, t1 = 0;                // query rows [t0, t1)
+    int64_t p0 = 0, window = 0, rot = 0;   // the band in the gathered cell order, as FaBand
+    std::vector<int32_t> cells;            // gathered row i = cache cell cells[i]; empty: the identity (rows are cells)
+};
+struct FaPlan { std::vector<FaSegment> segs; };     // empty: the mask is no band, run on the CPU
+
+static FaPlan fa_reject(int why) {
+    if (std::getenv("GGML_XDNA2_DEBUG")) fprintf(stderr, "ggml-xdna2: attention plan rejected (%d)\n", why);
+    return {};
+}
+
+static FaPlan xdna2_fa_segments(const ggml_tensor * mask, int64_t n_kv, int64_t n_tok) {
+    const uint16_t zero = 0x0000, ninf = 0xFC00;
+    auto row = [&](int64_t t) { return reinterpret_cast<const uint16_t *>(static_cast<const char *>(mask->data) + t * mask->nb[1]); };
+    // 1. per row: visible cell count, first and last visible cell (a value other than 0 and -inf is no band mask)
+    struct Row { int64_t cnt = 0, first = -1, last = -1; };
+    std::vector<Row> rows(static_cast<size_t>(n_tok));
+    for (int64_t t = 0; t < n_tok; ++t) {
+        const uint16_t * r = row(t);
+        Row & w = rows[size_t(t)];
+        for (int64_t c = 0; c < n_kv; ++c) {
+            if (r[c] == zero) { w.cnt++; if (w.first < 0) w.first = c; w.last = c; }
+            else if (r[c] != ninf) return fa_reject(1);
+        }
+        if (w.cnt == 0) return fa_reject(2);
+    }
+    // 2. a row continues the segment when it sees one more cell than the row before (or as many, a full window sliding on)
+    std::vector<int64_t> cut{0};
+    for (int64_t t = 1; t < n_tok; ++t) {
+        const Row & a = rows[size_t(t - 1)], & b = rows[size_t(t)];
+        const bool grows = b.cnt == a.cnt + 1 && b.first >= a.first;
+        const bool slides = b.cnt == a.cnt && b.first > a.first;
+        if (!(b.last > a.last && (grows || slides))) cut.push_back(t);
+    }
+    cut.push_back(n_tok);
+    if (std::getenv("GGML_XDNA2_DEBUG")) {
+        fprintf(stderr, "ggml-xdna2: attention batch of %lld rows over %lld cells, %zu segment(s):", (long long) n_tok, (long long) n_kv, cut.size() - 1);
+        for (size_t i = 0; i + 1 < cut.size() && i < 8; ++i) {
+            const Row & a = rows[size_t(cut[i])], & z = rows[size_t(cut[i + 1] - 1)];
+            fprintf(stderr, " [%lld..%lld cells %lld..%lld cnt %lld..%lld]", (long long) cut[i], (long long) cut[i + 1], (long long) a.first, (long long) z.last, (long long) a.cnt, (long long) z.cnt);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    FaPlan plan;
+    int n_short = 0;
+    std::vector<int32_t> idx(static_cast<size_t>(n_kv));
+    for (size_t si = 0; si + 1 < cut.size(); ++si) {
+        FaSegment sg;
+        sg.t0 = cut[si]; sg.t1 = cut[si + 1];
+        // a short piece (the last token of a prompt, a decode token of another sequence) costs a K/V gather and a kernel run of its own: a few
+        // are fine next to a long segment, many (a batch of decode streams) are faster on the CPU
+        if (sg.t1 - sg.t0 < FA_BLK && ++n_short > 4) return fa_reject(3);
+        // 3. the gathered cells: the first row's, then the cell each later row adds
+        std::vector<int32_t> g;
+        { const uint16_t * r = row(sg.t0); for (int64_t c = 0; c < n_kv; ++c) if (r[c] == zero) g.push_back(int32_t(c)); }
+        for (int64_t t = sg.t0 + 1; t < sg.t1; ++t) g.push_back(int32_t(rows[size_t(t)].last));
+        std::sort(g.begin(), g.end());
+        if (std::adjacent_find(g.begin(), g.end()) != g.end()) return fa_reject(4);
+        std::fill(idx.begin(), idx.end(), -1);
+        for (size_t i = 0; i < g.size(); ++i) idx[size_t(g[i])] = int32_t(i);
+        // 4. every row must see exactly the gathered cells lo(t) .. p0 + t - t0: lo = 0 (causal) or a window of a multiple of 16 cells
+        const Row & last = rows[size_t(sg.t1 - 1)];
+        sg.p0 = idx[size_t(rows[size_t(sg.t0)].last)];
+        const int64_t hi_last = sg.p0 + (sg.t1 - 1 - sg.t0), lo_last = idx[size_t(last.first)];
+        if (sg.p0 < 0 || lo_last < 0 || hi_last != int64_t(g.size()) - 1) return fa_reject(5);
+        sg.window = lo_last == 0 ? 0 : hi_last - lo_last + 1;
+        if (sg.window % FA_BLK != 0) return fa_reject(6);
+        for (int64_t t = sg.t0; t < sg.t1; ++t) {
+            const int64_t hi = sg.p0 + (t - sg.t0), lo = sg.window ? std::max<int64_t>(0, hi - sg.window + 1) : 0;
+            const uint16_t * r = row(t);
+            for (int64_t c = 0; c < n_kv; ++c) {
+                const int32_t i = idx[size_t(c)];
+                if ((r[c] == zero) != (i >= lo && i <= hi)) return fa_reject(7);      // i = -1 is below every lo >= 0
+            }
+        }
+        bool identity = true;
+        for (size_t i = 0; i < g.size() && identity; ++i) identity = g[i] == int32_t(i);
+        if (!identity) sg.cells = std::move(g);
+        plan.segs.push_back(std::move(sg));
+    }
+    return plan;
+}
+
+// 64-bit hash of the first n_tok rows of the mask: the key of its plan. (The graph id is no key: every layer's attention is a split of its own.)
+static uint64_t xdna2_fa_mask_hash(const ggml_tensor * mask, int64_t n_kv, int64_t n_tok) {
+    constexpr uint64_t P = 1099511628211ull;
+    uint64_t h[4] = { 1469598103934665603ull, 1469598103934665603ull ^ 1, 1469598103934665603ull ^ 2, 1469598103934665603ull ^ 3 };
+    const size_t words = size_t(n_kv) * sizeof(uint16_t) / sizeof(uint64_t);
+    for (int64_t t = 0; t < n_tok; ++t) {
+        const char * r = static_cast<const char *>(mask->data) + t * mask->nb[1];
+        size_t i = 0;
+        for (; i + 4 <= words; i += 4) {
+            uint64_t w[4];
+            std::memcpy(w, r + i * sizeof(uint64_t), sizeof(w));
+            for (int l = 0; l < 4; ++l) { h[l] ^= w[l]; h[l] *= P; }
+        }
+        for (; i < words; ++i) {
+            uint64_t w;
+            std::memcpy(&w, r + i * sizeof(uint64_t), sizeof(w));
+            h[0] ^= w; h[0] *= P;
+        }
+        for (size_t o = words * sizeof(uint64_t); o < size_t(n_kv) * sizeof(uint16_t); ++o) { h[1] ^= static_cast<unsigned char>(r[o]); h[1] *= P; }
+    }
+    return ((h[0] * P ^ h[1]) * P ^ h[2]) * P ^ h[3];
+}
+
+// The plan of a FLASH_ATTN_EXT mask, checked once per distinct mask (all layers of a kind share it; two are cached: the full and the sliding-window
+// one). A single band is the common case (one sequence in the batch) and keeps the cell-indexed shadow of the layer.
+static std::shared_ptr<const FaPlan> xdna2_fa_plan(const ggml_tensor * mask, int64_t n_kv, int64_t n_tok) {
+    struct Entry { uint64_t hash = 0; int64_t kv = -1, tok = -1; std::shared_ptr<const FaPlan> plan; };
+    static Entry cache[2];
+    static int next = 0;
+    const uint64_t hash = xdna2_fa_mask_hash(mask, n_kv, n_tok);
+    for (const Entry & e : cache) {
+        if (e.plan && e.hash == hash && e.kv == n_kv && e.tok == n_tok) return e.plan;
+    }
+    auto plan = std::make_shared<FaPlan>();
+    const FaBand b = xdna2_fa_single_band(mask, n_kv, n_tok);
+    if (b.p0 >= 0) {
+        FaSegment sg;
+        sg.t0 = 0; sg.t1 = n_tok; sg.p0 = b.p0; sg.window = b.window; sg.rot = b.rot;
+        plan->segs.push_back(std::move(sg));
+    } else {
+        *plan = xdna2_fa_segments(mask, n_kv, n_tok);
+    }
+    cache[next] = Entry{ hash, n_kv, n_tok, plan };
+    next ^= 1;
+    return plan;
 }
 
 // FLASH_ATTN_EXT whose mask is not a causal band: ggml's CPU flash attention (the CPU backend from the registry) on the same tensors.
@@ -694,40 +823,44 @@ static void xdna2_fa_host(const ggml_tensor * op) {
 static void ggml_backend_xdna2_flash_attn(ggml_backend_xdna2_context * ctx, ggml_tensor * op) {
     xdna2_flush(ctx);      // queued mul_mats first (graph order)
     const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * mask = op->src[3];
-    const FaBand band = xdna2_fa_band(mask, k->ne[1], q->ne[1], ctx->n_graphs);
-    const int64_t p0 = band.p0;
-    if (p0 < 0) {
+    const auto plan = xdna2_fa_plan(mask, k->ne[1], q->ne[1]);
+    if (plan->segs.empty()) {
         xdna2_fa_host(op);
         return;
     }
     const ggml_tensor * kc = k->view_src ? k->view_src : k;
-    AttnJob j;
-    j.shape = xdna2_fa_shape(op);
-    j.q = (const float *) q->data;
-    j.q_tok_stride = q->nb[1];
-    j.q_head_stride = q->nb[2];
-    j.n_tok = q->ne[1];
-    j.p0 = p0;
-    j.window = band.window;
-    j.rot = band.rot;
-    j.n_cells = k->ne[1];
-    j.k = k->data;
-    j.v = v->data;
-    j.bf16 = k->type == GGML_TYPE_BF16;
-    j.kv_row_stride = k->nb[1];
-    j.kv_head_stride = k->nb[2];
-    j.kv_cap = int64_t(ggml_nbytes(kc) / k->nb[1]);
-    j.kv_id = kc->data;
-    j.dst = (float *) op->data;
-    j.dst_tok_stride = op->nb[2];
-    j.dst_head_stride = op->nb[1];
-    std::memcpy(&j.scale, (const float *) op->op_params + 0, sizeof(float));
-    const double t0 = xdna2_now();
-    if (!npu_executor().run_attention(j)) {
-        GGML_ABORT("ggml-xdna2: NPU attention failed");
+    int slot = 0;      // shadow of the layer's cache (0) or of a gathered sequence (1, 2, ..)
+    for (const FaSegment & sg : plan->segs) {
+        AttnJob j;
+        j.shape = xdna2_fa_shape(op);
+        j.q = (const float *) ((const char *) q->data + sg.t0 * q->nb[1]);
+        j.q_tok_stride = q->nb[1];
+        j.q_head_stride = q->nb[2];
+        j.n_tok = sg.t1 - sg.t0;
+        j.p0 = sg.p0;
+        j.window = sg.window;
+        j.rot = sg.rot;
+        j.cells = sg.cells.empty() ? nullptr : sg.cells.data();
+        j.shadow_slot = sg.cells.empty() ? 0 : ++slot;
+        j.n_cells = k->ne[1];
+        j.k = k->data;
+        j.v = v->data;
+        j.bf16 = k->type == GGML_TYPE_BF16;
+        j.kv_row_stride = k->nb[1];
+        j.kv_head_stride = k->nb[2];
+        j.kv_cap = sg.cells.empty() ? int64_t(ggml_nbytes(kc) / k->nb[1]) : 0;
+        j.kv_id = kc->data;
+        j.dst = (float *) ((char *) op->data + sg.t0 * op->nb[2]);
+        j.dst_tok_stride = op->nb[2];
+        j.dst_head_stride = op->nb[1];
+        std::memcpy(&j.scale, (const float *) op->op_params + 0, sizeof(float));
+        const double t0 = xdna2_now();
+        if (!npu_executor().run_attention(j)) {
+            GGML_ABORT("ggml-xdna2: NPU attention failed");
+        }
+        ctx->t_fa += xdna2_now() - t0;
+        ctx->n_fa++;
     }
-    ctx->t_fa += xdna2_now() - t0;
-    ctx->n_fa++;
 }
 
 static bool xdna2_fuse_enabled() {

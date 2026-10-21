@@ -9,7 +9,7 @@ What runs where:
 | Work | Where |
 |---|---|
 | Prompt processing: weight matmuls | NPU |
-| Prompt processing: attention (head dim 128/256, 4 or 8 KV heads, up to 4 query heads per KV head, causal or sliding window) | NPU |
+| Prompt processing: attention (head dim 128/256, 4 or 8 KV heads, up to 4 query heads per KV head, causal or sliding window, also with several prompts in one `llama-server` batch) | NPU |
 | Prompt processing: everything else (norms, RoPE, the Qwen3.5 linear-attention layers, other attention shapes) | CPU |
 | Token generation (decode) | CPU (AVX-512), reading the weights from the NPU's copy in place |
 
