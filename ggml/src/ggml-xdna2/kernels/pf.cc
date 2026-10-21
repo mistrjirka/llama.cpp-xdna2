@@ -15,16 +15,17 @@
 #define MT 64                       // tokens per tile
 #define MB (MT / 8)                 // 8-token blocks
 // per-record scale tables, overlaid by qtype (only one record is in flight):
-//   Q4_K/Q5_K : SV[j][nb][64] bf16 (2 KB), BV[j][nb][64] bf16 (2 KB)          j = 32-k sub-block, nb = 8-row half
+//   Q4_K/Q5_K/Q4_0/Q4_1 : SVH/SVL[j][nb][64] bf16 (2 KB each: a = d*sc split in two bf16), CSTAGE[j][16] f32 (512 B: c = b - 128 a, replicated
+//                         over the 64 lanes by the expand loop, see rep_c)   j = 32-k sub-block, nb = 8-row half.  a and b must stay (nearly) exact: for a positive activation vector the weights'
+//                         mean a*q + b cancels, so a bf16-rounded a or b becomes a coherent error (NMSE 8e-4, see test_mul_mat_pos)
 //   Q6_K      : SV6[s][nb][64] bf16 (4 KB)                                    s = 16-k sub-block
 //   Q8_0      : SVH[b][nb][64], SVL[b][nb][64] bf16 (2 KB each)               b = 32-k block (d split in two bf16)
 alignas(64) static uint8_t TBL[6144];
-#define SV  ((bfloat16 (*)[2][64])(TBL))
-#define BV  ((bfloat16 (*)[2][64])(TBL + 2048))
+#define CSTAGE ((float *)(TBL + 4096))
 #define SV6 ((bfloat16 (*)[2][64])(TBL))
 #define SVH ((bfloat16 (*)[2][64])(TBL))
 #define SVL ((bfloat16 (*)[2][64])(TBL + 2048))
-alignas(64) static bfloat16 SCB[256], MNB[128], ABF[256], BBF[128];
+alignas(64) static bfloat16 SCB[256], MNB[128], ABF[256];
 
 // fp16 (uint16 x16) -> f32 x16 (normal, zero, denormal)
 static inline aie::vector<float, 16> h2f(const uint16_t *p) {
@@ -42,19 +43,42 @@ static inline aie::vector<float, 16> h2f(const uint16_t *p) {
   return aie::select(r, aie::neg(r), isneg);
 }
 
-// SV[j][nb] / BV[j][nb] (64 bf16, [n][k] replicated) from ABF / BBF [j][n]
-__attribute__((noinline)) static void fill_sv_bv() {
+// f = hi + lo in two bf16 pieces: exact for the 11-bit fp16 scales, 2^-17 relative for a 17-bit d*sc.  (A cheaper truncating split with
+// bit masks is 300 B larger: the kernel is within ~1 KB of the 16 KB program memory, XAIE_INVALID_ELF beyond.)
+static inline void split_hilo(aie::vector<float, 16> f, aie::vector<bfloat16, 16> &hi, aie::vector<bfloat16, 16> &lo) {
+  aie::accum<accfloat, 16> t, u;
+  t.from_vector(f); hi = t.to_vector<bfloat16>();
+  u.from_vector(hi);
+  t.from_vector(aie::sub(f, u.to_vector<float>()));
+  lo = t.to_vector<bfloat16>();
+}
+
+// SVH/SVL[j][nb] (64 lanes, [n][k] replicated) from ABF (a hi), SCB (a lo), each [j][n]
+__attribute__((noinline)) static void fill_tables() {
   AIE_LOOP_UNROLL(4)
   for (int i = 0; i < 16; i++) {           // i = j*2 + nb
-    aie::vector<bfloat16, 8> a8 = aie::load_v<8>(ABF + i * 8), b8 = aie::load_v<8>(BBF + i * 8);
-    aie::vector<bfloat16, 64> av = aie::transpose(a8.grow_replicate<64>(), 8, 8);
-    aie::vector<bfloat16, 64> bv = aie::transpose(b8.grow_replicate<64>(), 8, 8);
-    aie::store_v(&SV[0][0][0] + i * 64, av);
-    aie::store_v(&BV[0][0][0] + i * 64, bv);
+    aie::vector<bfloat16, 8> h8 = aie::load_v<8>(ABF + i * 8), l8 = aie::load_v<8>(SCB + i * 8);
+    aie::store_v(&SVH[0][0][0] + i * 64, aie::transpose(h8.grow_replicate<64>(), 8, 8));
+    aie::store_v(&SVL[0][0][0] + i * 64, aie::transpose(l8.grow_replicate<64>(), 8, 8));
   }
 }
 
-// ---- scale prep v4: SV[j][nb] = bf16(d*sc_j) replicated [n][k]; BV[j][nb] = bf16(-dmin*m_j) replicated (the expand forms -b - 128*a)
+// c[j] (16 floats, one per row n) replicated over the 8 k lanes of each row, as two 64-lane vectors (rows 0-7, 8-15).  No 32-bit transpose on
+// AIE2P: three zip levels instead.
+static inline void rep_c(int j, aie::vector<float, 64> &r0, aie::vector<float, 64> &r1) {
+  const aie::vector<float, 16> c = aie::load_v<16>(CSTAGE + j * 16);
+  auto [l0, h0] = aie::interleave_zip(c, c, 1);        // c0 c0 .. c7 c7 | c8 c8 .. c15 c15
+  auto [l1, h1] = aie::interleave_zip(l0, l0, 1);      // c0 x4 .. c3 x4 | c4 x4 .. c7 x4
+  auto [l2, h2] = aie::interleave_zip(h0, h0, 1);      // c8 x4 .. c11 x4 | c12 x4 .. c15 x4
+  auto [a0, a1] = aie::interleave_zip(l1, l1, 1);
+  auto [a2, a3] = aie::interleave_zip(h1, h1, 1);
+  auto [b0, b1] = aie::interleave_zip(l2, l2, 1);
+  auto [b2, b3] = aie::interleave_zip(h2, h2, 1);
+  r0 = aie::concat(aie::concat(a0, a1), aie::concat(a2, a3));
+  r1 = aie::concat(aie::concat(b0, b1), aie::concat(b2, b3));
+}
+
+// ---- scale prep v5: a_j = d*sc_j (hi/lo bf16), c_j = -dmin*m_j - 128 a_j (f32); the expand forms c + x*a with x = 128 + q
 template <int SCO, int DO, int DMO>
 static inline void prep_scales_k(const int8_t *__restrict rec) {
   const uint8_t *scp = (const uint8_t *)(rec + SCO);
@@ -88,35 +112,43 @@ static inline void prep_scales_k(const int8_t *__restrict rec) {
     aie::store_v(SCB + jp * 32, aie::to_float<bfloat16>(scp2[jp]));
     aie::store_v(MNB + jp * 32, aie::to_float<bfloat16>(mnp2[jp]));
   }
-  AIE_LOOP_UNROLL_FULL
+  const aie::vector<bfloat16, 16> m128 = aie::broadcast<bfloat16, 16>(-128.0f);
+  AIE_LOOP_UNROLL(2)                       // rolled (NO_UNROLL) crashes the Peano encoder (getmBMsOpValue)
   for (int j = 0; j < 8; j++) {
     aie::vector<bfloat16, 16> sc16 = aie::load_v<16>(SCB + j * 16), mn16 = aie::load_v<16>(MNB + j * 16);
     aie::accum<accfloat, 16> aa = aie::mul(d_hi, sc16);
     aa = aie::mac(aa, d_lo, sc16);
-    aie::vector<bfloat16, 16> a_bf = aa.to_vector<bfloat16>();
-    aie::accum<accfloat, 16> bb = aie::mul(n_hi, mn16);
+    const aie::vector<float, 16> a_f = aa.to_vector<float>();
+    aie::vector<bfloat16, 16> a_hi, a_lo;
+    split_hilo(a_f, a_hi, a_lo);
+    aie::store_v(ABF + j * 16, a_hi); aie::store_v(SCB + j * 16, a_lo);       // SCB: the scales are consumed
+    aie::accum<accfloat, 16> bb = aie::mul(n_hi, mn16);                       // c = b - 128 (a_hi + a_lo)
     bb = aie::mac(bb, n_lo, mn16);
-    aie::vector<bfloat16, 16> b_bf = bb.to_vector<bfloat16>();
-    aie::store_v(ABF + j * 16, a_bf); aie::store_v(BBF + j * 16, b_bf);
+    bb = aie::mac(bb, a_hi, m128);
+    bb = aie::mac(bb, a_lo, m128);
+    aie::store_v(CSTAGE + j * 16, bb.to_vector<float>());
   }
-  fill_sv_bv();
+  fill_tables();
 }
 
 // ---- Q4_0 / Q4_1 scale prep: the Q4_K form w = a*q + b per 32-k block j with a = d, b = -8 d (Q4_0) or m (Q4_1)
 __attribute__((noinline)) static void prep_q40(const int8_t *__restrict rec, bool q41) {
-  // i < 8: a_j = d_j (fp16 at 2048);  i >= 8: b_j = -8 d_j (Q4_0, from 2048) or m_j (Q4_1, fp16 at 2304).  One fp16 decode (program memory).
-  const float sb = q41 ? 1.0f : -8.0f;
-  const int ob = q41 ? 2304 : 2048;
+  const aie::vector<bfloat16, 16> m128 = aie::broadcast<bfloat16, 16>(-128.0f);
   AIE_LOOP_NO_UNROLL
-  for (int i = 0; i < 16; i++) {
-    const int j = i & 7, hi = i >> 3;
-    aie::vector<float, 16> v = h2f((const uint16_t *)(rec + (hi ? ob : 2048) + j * 32));
-    v = aie::mul(v, aie::broadcast<float, 16>(hi ? sb : 1.0f)).to_vector<float>();
-    aie::accum<accfloat, 16> t;
-    t.from_vector(v);
-    aie::store_v((hi ? BBF : ABF) + j * 16, t.to_vector<bfloat16>());
+  for (int j = 0; j < 8; j++) {
+    const aie::vector<float, 16> a_f = h2f((const uint16_t *)(rec + 2048 + j * 32));
+    const aie::vector<float, 16> b_f = q41 ? h2f((const uint16_t *)(rec + 2304 + j * 32))
+                                           : aie::mul(a_f, aie::broadcast<float, 16>(-8.0f)).to_vector<float>();
+    aie::vector<bfloat16, 16> a_hi, a_lo;
+    split_hilo(a_f, a_hi, a_lo);
+    aie::store_v(ABF + j * 16, a_hi); aie::store_v(SCB + j * 16, a_lo);
+    aie::accum<accfloat, 16> bb;                                              // c = b - 128 (a_hi + a_lo)
+    bb.from_vector(b_f);
+    bb = aie::mac(bb, a_hi, m128);
+    bb = aie::mac(bb, a_lo, m128);
+    aie::store_v(CSTAGE + j * 16, bb.to_vector<float>());
   }
-  fill_sv_bv();
+  fill_tables();
 }
 
 // ---- expand v2: x = bf16(128+q) built by byte-zip with 0x43 (no int->float convert); w = a*x - 128*a - b via 2 macs
@@ -125,11 +157,13 @@ __attribute__((noinline)) static void prep_q40(const int8_t *__restrict rec, boo
 #endif
 static inline void expand_q4(const int8_t *__restrict rec, int8_t *__restrict Bt) {
   const aie::vector<uint8, 64> c43 = aie::broadcast<uint8, 64>(0x43);
-  const aie::vector<bfloat16, 64> m128 = aie::broadcast<bfloat16, 64>(-128.0f);
   aie::block_vector_output_buffer_stream<bfp16ebs8, 64> out((bfp16ebs8 *)Bt);
   aie::vector<uint8, 64> sink = aie::zeros<uint8, 64>();
   for (int j = 0; j < 8; j++) {
-    const aie::vector<bfloat16, 64> sv0 = aie::load_v<64>(SV[j][0]), sv1 = aie::load_v<64>(SV[j][1]);
+    const aie::vector<bfloat16, 64> sh0 = aie::load_v<64>(SVH[j][0]), sh1 = aie::load_v<64>(SVH[j][1]);
+    const aie::vector<bfloat16, 64> sl0 = aie::load_v<64>(SVL[j][0]), sl1 = aie::load_v<64>(SVL[j][1]);
+    aie::vector<float, 64> c0, c1;
+    rep_c(j, c0, c1);
     AIE_LOOP_UNROLL_FULL
     for (int t = 0; t < 4; t++) {                 // (hf, h) -> kb = 4j + t
       aie::vector<uint4, 128> q4 = aie::load_v<128>((const uint4 *)(rec + (2 * j + (t >> 1)) * 128 + (t & 1) * 64));
@@ -147,9 +181,9 @@ static inline void expand_q4(const int8_t *__restrict rec, int8_t *__restrict Bt
       sink = aie::bit_xor(sink, aie::bit_xor(x0.cast_to<uint8>().extract<64>(0), x1.cast_to<uint8>().extract<64>(1)));
 #else
       aie::accum<accfloat, 64> acc0, acc1;
-      acc0.from_vector(aie::load_v<64>(BV[j][0])); acc1.from_vector(aie::load_v<64>(BV[j][1]));
-      acc0 = aie::mac(acc0, m128, sv0); acc1 = aie::mac(acc1, m128, sv1);     // -b - 128 a (as the former AC0 table: same op order)
-      acc0 = aie::mac(acc0, x0, sv0); acc1 = aie::mac(acc1, x1, sv1);
+      acc0.from_vector(c0); acc1.from_vector(c1);     // c = b - 128 a
+      acc0 = aie::mac(acc0, x0, sh0); acc1 = aie::mac(acc1, x1, sh1);
+      acc0 = aie::mac(acc0, x0, sl0); acc1 = aie::mac(acc1, x1, sl1);
       out.push(aie::block_vector<bfp16ebs8, 64>(::to_v64bfp16ebs8(acc0)));
       out.push(aie::block_vector<bfp16ebs8, 64>(::to_v64bfp16ebs8(acc1)));
 #endif
@@ -168,6 +202,8 @@ static inline void expand_q5(const int8_t *__restrict rec, int8_t *__restrict Bt
   AIE_LOOP_NO_UNROLL
   for (int j = 0; j < 8; j++) {
     const aie::vector<uint32, 16> V = aie::load_v<64>((const uint8 *)(rec + 2048 + j * 64)).cast_to<uint32>();
+    aie::vector<float, 64> cr[2];
+    rep_c(j, cr[0], cr[1]);
     AIE_LOOP_UNROLL_FULL
     for (int h = 0; h < 2; h++) {                     // tile t = 2j + h: bit (c + 4h) of the hi byte
       aie::vector<uint8, 64> T[4];
@@ -186,10 +222,9 @@ static inline void expand_q5(const int8_t *__restrict rec, int8_t *__restrict Bt
         auto [z0, z1] = aie::interleave_zip(T[c], c43, 1);
         aie::vector<bfloat16, 64> x = aie::concat(z0.cast_to<bfloat16>(), z1.cast_to<bfloat16>());
         aie::accum<accfloat, 64> acc;
-        const aie::vector<bfloat16, 64> sv = aie::load_v<64>(SV[j][nb]);
-        acc.from_vector(aie::load_v<64>(BV[j][nb]));
-        acc = aie::mac(acc, aie::broadcast<bfloat16, 64>(-128.0f), sv);
-        acc = aie::mac(acc, x, sv);
+        acc.from_vector(cr[nb]);
+        acc = aie::mac(acc, x, aie::load_v<64>(SVH[j][nb]));
+        acc = aie::mac(acc, x, aie::load_v<64>(SVL[j][nb]));
         out.push(aie::block_vector<bfp16ebs8, 64>(::to_v64bfp16ebs8(acc)));
       }
     }
@@ -197,13 +232,6 @@ static inline void expand_q5(const int8_t *__restrict rec, int8_t *__restrict Bt
 }
 
 // ================= Q6_K (REC 3360): lo nibbles B-tiles [0,2048), hi2 [2048,3072), int8 scales [t][n] 3072, d 3328 =================
-static inline void split_hilo(aie::vector<float, 16> f, aie::vector<bfloat16, 16> &hi, aie::vector<bfloat16, 16> &lo) {
-  aie::accum<accfloat, 16> t, u;
-  t.from_vector(f); hi = t.to_vector<bfloat16>();
-  u.from_vector(hi);
-  t.from_vector(aie::sub(f, u.to_vector<float>()));
-  lo = t.to_vector<bfloat16>();
-}
 static inline void prep_q6(const int8_t *__restrict rec) {
   aie::vector<bfloat16, 16> d_hi, d_lo;
   split_hilo(h2f((const uint16_t *)(rec + 3328)), d_hi, d_lo);
