@@ -61,8 +61,8 @@ its Peano compiler (`llvm-aie`) in a Python venv. `scripts/xdna2-setup.sh` check
 about 1.4 GB on disk, no root):
 
 ```sh
-git clone -b xdna2-universal https://github.com/mistrjirka/llama.cpp
-cd llama.cpp
+git clone https://github.com/mistrjirka/llama.cpp-xdna2
+cd llama.cpp-xdna2
 scripts/xdna2-setup.sh
 ```
 
