@@ -127,7 +127,7 @@ __attribute__((noinline)) static void prep_scales_k(const uint8_t *__restrict sc
   split_hilo(aie::neg(h2f(dmp)), n_hi, n_lo);
   const aie::vector<bfloat16, 32> dh = aie::concat(d_hi, d_hi), dl = aie::concat(d_lo, d_lo), nh = aie::concat(n_hi, n_hi), nl = aie::concat(n_lo, n_lo);
   const aie::vector<bfloat16, 32> one = aie::broadcast<bfloat16, 32>(1.0f), m128 = aie::broadcast<bfloat16, 32>(-128.0f);
-  AIE_LOOP_UNROLL_FULL
+  AIE_LOOP_NO_UNROLL
   for (int jp = 0; jp < 4; jp++) {            // sub-blocks j = 2jp, 2jp+1
     const aie::vector<bfloat16, 32> s = aie::load_v<32>(SCB + jp * 32), m = aie::load_v<32>(MNB + jp * 32);
     aie::accum<accfloat, 32> aa = aie::mul(dh, s);
