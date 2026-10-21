@@ -315,6 +315,19 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
 
+if (GGML_XDNA2)
+    # Compares every op the NPU backend claims against the CPU backend. Needs the NPU: exclude with `ctest -LE xdna2`.
+    # test-backend-ops exits 0 when -b matches no device, so a missing NPU would pass silently; the regexes make it
+    # require an explicit "Backend XDNA2: OK" line instead. The FA_MIN_* variables lower the size thresholds below which attention stays on
+    # the CPU, so the test_flash_attn_ext_causal cases reach the NPU kernel (correctness only, not a speed setting).
+    llama_test(test-backend-ops NAME test-backend-ops-xdna2 LABEL xdna2 ARGS test -b XDNA2)
+    set_tests_properties(test-backend-ops-xdna2 PROPERTIES
+        PASS_REGULAR_EXPRESSION "Backend XDNA2: [^\n]*OK"
+        FAIL_REGULAR_EXPRESSION "Backend XDNA2: [^\n]*FAIL"
+        ENVIRONMENT "GGML_XDNA2_FA_MIN_TOK=1;GGML_XDNA2_FA_MIN_KV=1"
+        RESOURCE_LOCK xdna2-npu)
+endif()
+
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

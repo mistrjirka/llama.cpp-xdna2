@@ -8520,6 +8520,44 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// flash attention with the mask of a decoder prefill: the nb queries are the last nb positions, query t sees the cells 0 .. kv - nb + t
+// (window > 0: only the last `window` of them). The random masks of test_flash_attn_ext are no such band, so accelerators that only run
+// banded attention (XDNA2: GGML_XDNA2_FA_MIN_TOK=1 GGML_XDNA2_FA_MIN_KV=1 lowers its size thresholds) fall back to the CPU on them.
+struct test_flash_attn_ext_causal : public test_flash_attn_ext {
+    const int64_t window;
+    const float q_range;    // > 0: q uniform in [-q_range, q_range] instead of [-1, 1], so the softmax is peaked
+
+    test_flash_attn_ext_causal(int64_t hs, int64_t n_head_kv, int64_t n_group, int64_t kv, int64_t nb, int64_t window = 0,
+                               ggml_type type_KV = GGML_TYPE_F16, float q_range = 0.0f)
+        // {0, 2, 1, 3}: K/V as a KV cache stores them, one row of n_head_kv heads per cell
+        : test_flash_attn_ext(hs, hs, n_head_kv, {n_group, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}),
+          window(window), q_range(q_range) {
+        GGML_ASSERT(nb <= kv);
+    }
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",causal=1,window=" + std::to_string(window) + ",q_range=" + std::to_string(q_range);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        if (q_range > 0.0f) {
+            init_tensor_uniform(ggml_get_tensor(ctx, "q"), -q_range, q_range);
+        }
+
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        const int64_t n_kv = m->ne[0], n_tok = m->ne[1], p0 = n_kv - n_tok;
+        std::vector<ggml_fp16_t> data(ggml_nelements(m));
+        for (int64_t t = 0; t < n_tok; ++t) {
+            const int64_t last = p0 + t, first = window > 0 ? std::max<int64_t>(0, last - window + 1) : 0;
+            for (int64_t c = 0; c < n_kv; ++c) {
+                data[t*n_kv + c] = ggml_fp32_to_fp16(c >= first && c <= last ? 0.0f : -INFINITY);
+            }
+        }
+        ggml_backend_tensor_set(m, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11647,6 +11685,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
                 }
+            }
+        }
+    }
+
+    // causal prefill masks over a KV-cache-layout cache: a band mask is what an accelerated attention kernel can actually run
+    for (int hs : { 128, 256 }) {
+        for (int n_head_kv : { 4, 8 }) {
+            for (int n_group : { 1, 4 }) {
+                for (int kv : { 512, 1030 }) {
+                    for (int nb : { 1, 17, 75, 128 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext_causal(hs, n_head_kv, n_group, kv, nb));
+                    }
+                }
+                test_cases.emplace_back(new test_flash_attn_ext_causal(hs, n_head_kv, n_group, 1030, 128, 256));  // sliding window
+                test_cases.emplace_back(new test_flash_attn_ext_causal(hs, n_head_kv, n_group, 1030, 75, 48));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext_causal(hs, n_head_kv, 4, 1030, 75, 0, GGML_TYPE_BF16));
+            for (float q_range : { 4.0f, 20.0f }) {
+                test_cases.emplace_back(new test_flash_attn_ext_causal(hs, n_head_kv, 4, 1030, 75, 0, GGML_TYPE_F16, q_range));
             }
         }
     }
